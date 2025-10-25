@@ -142,6 +142,14 @@ script.Exec("ping 127.0.0.1").Stdout()
 
 Note that `Exec` runs the command concurrently: it doesn't wait for the command to complete before returning any output. That's good, because this `ping` command will run forever (or until we get bored).
 
+If you need to prevent a command from running indefinitely, you can set a timeout:
+
+```go
+script.NewPipe().WithTimeout(5*time.Second).Exec("potentially-hanging-command").Wait()
+```
+
+If the command doesn't complete within the timeout, it will be terminated and an error will be set.
+
 Instead, when we read from the pipe using `Stdout`, we see each line of output as it's produced:
 
 ```
@@ -328,6 +336,7 @@ These are methods on a pipe that change its configuration:
 | [`WithReader`](https://pkg.go.dev/github.com/bitfield/script#Pipe.WithReader) | pipe source |
 | [`WithStderr`](https://pkg.go.dev/github.com/bitfield/script#Pipe.WithStderr) | standard error output stream for command |
 | [`WithStdout`](https://pkg.go.dev/github.com/bitfield/script#Pipe.WithStdout) | standard output stream for pipe |
+| [`WithTimeout`](https://pkg.go.dev/github.com/bitfield/script#Pipe.WithTimeout) | timeout for exec commands |
 
 ## Filters
 

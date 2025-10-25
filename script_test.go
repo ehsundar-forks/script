@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/bitfield/script"
 	"github.com/google/go-cmp/cmp"
@@ -1262,6 +1263,150 @@ func TestExecRunsGoHelpAndGetsUsageMessage(t *testing.T) {
 	}
 	if !strings.Contains(output, "Usage") {
 		t.Fatalf("want output containing the word 'Usage', got %q", output)
+	}
+}
+
+func TestExecWithTimeout_AllowsCommandToCompleteWithinTimeout(t *testing.T) {
+	t.Parallel()
+	_, err := script.NewPipe().WithTimeout(5 * time.Second).Exec("echo test").String()
+	if err != nil {
+		t.Errorf("unexpected error for command within timeout: %v", err)
+	}
+}
+
+func TestExecWithTimeout_NoTimeoutWhenNotSet(t *testing.T) {
+	t.Parallel()
+	_, err := script.Exec("echo test").String()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestExecWithTimeout_ZeroTimeoutMeansNoTimeout(t *testing.T) {
+	t.Parallel()
+	_, err := script.NewPipe().WithTimeout(0).Exec("echo test").String()
+	if err != nil {
+		t.Errorf("unexpected error with zero timeout: %v", err)
+	}
+}
+
+func TestExecWithTimeout_TerminatesLongRunningCommand(t *testing.T) {
+	t.Parallel()
+	p := script.NewPipe().WithTimeout(100 * time.Millisecond).Exec("sleep 2")
+	err := p.Wait()
+	if err == nil {
+		t.Error("want error for command exceeding timeout")
+	}
+
+	if !strings.Contains(err.Error(), "context deadline exceeded") &&
+		!strings.Contains(err.Error(), "signal: killed") {
+		t.Errorf("want context deadline exceeded or killed error, got: %v", err)
+	}
+}
+
+func TestExecForEachWithTimeout_RespectsTimeout(t *testing.T) {
+	t.Parallel()
+	p := script.Echo("test").WithTimeout(100 * time.Millisecond).ExecForEach("sleep 2")
+	err := p.Wait()
+	if err == nil {
+		t.Error("want error for ExecForEach exceeding timeout")
+		return
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") &&
+		!strings.Contains(err.Error(), "signal: killed") {
+		t.Errorf("want context deadline exceeded or killed error, got: %v", err)
+	}
+}
+
+func TestExecForEachWithTimeout_AllowsQuickCommands(t *testing.T) {
+	t.Parallel()
+	output, err := script.Echo("hello\nworld").WithTimeout(5 * time.Second).ExecForEach("echo {{.}}").String()
+	if err != nil {
+		t.Errorf("unexpected error for quick commands: %v", err)
+	}
+	expected := "hello\nworld\n"
+	if output != expected {
+		t.Errorf("want %q, got %q", expected, output)
+	}
+}
+
+func TestExecForEachWithTimeout_MultipleCommands(t *testing.T) {
+	t.Parallel()
+	input := "cmd1\ncmd2\ncmd3"
+	p := script.Echo(input).WithTimeout(50 * time.Millisecond).ExecForEach("sleep 1")
+	err := p.Wait()
+	if err == nil {
+		t.Error("want error for multiple commands exceeding timeout")
+	}
+}
+
+func TestExecForEachWithTimeout_NoTimeout(t *testing.T) {
+	t.Parallel()
+	output, err := script.Echo("test").ExecForEach("echo {{.}}").String()
+	if err != nil {
+		t.Errorf("unexpected error without timeout: %v", err)
+	}
+	expected := "test\n"
+	if output != expected {
+		t.Errorf("want %q, got %q", expected, output)
+	}
+}
+
+func TestExecForEachWithTimeout_ZeroTimeout(t *testing.T) {
+	t.Parallel()
+	output, err := script.Echo("test").WithTimeout(0).ExecForEach("echo {{.}}").String()
+	if err != nil {
+		t.Errorf("unexpected error with zero timeout: %v", err)
+	}
+	expected := "test\n"
+	if output != expected {
+		t.Errorf("want %q, got %q", expected, output)
+	}
+}
+
+func TestExecForEachWithTimeout_DifferentCommands(t *testing.T) {
+	t.Parallel()
+	testCases := []struct {
+		name          string
+		command       string
+		timeout       time.Duration
+		shouldTimeout bool
+	}{
+		{
+			name:          "echo command with long timeout",
+			command:       "echo {{.}}",
+			timeout:       5 * time.Second,
+			shouldTimeout: false,
+		},
+		{
+			name:          "sleep command with short timeout",
+			command:       "sleep 2",
+			timeout:       100 * time.Millisecond,
+			shouldTimeout: true,
+		},
+		{
+			name:          "ping command with short timeout",
+			command:       "ping -c 5 127.0.0.1",
+			timeout:       50 * time.Millisecond,
+			shouldTimeout: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := script.Echo("test").WithTimeout(tc.timeout).ExecForEach(tc.command)
+			err := p.Wait()
+
+			if tc.shouldTimeout {
+				if err == nil {
+					t.Error("want error for command that should timeout")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for command that should not timeout: %v", err)
+				}
+			}
+		})
 	}
 }
 

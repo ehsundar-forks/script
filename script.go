@@ -3,6 +3,7 @@ package script
 import (
 	"bufio"
 	"container/ring"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+	"time"
 
 	"github.com/itchyny/gojq"
 	"mvdan.cc/sh/v3/shell"
@@ -34,10 +36,11 @@ type Pipe struct {
 	stdout     io.Writer
 	httpClient *http.Client
 
-	mu     *sync.Mutex
-	err    error
-	stderr io.Writer
-	env    []string
+	mu      *sync.Mutex
+	err     error
+	stderr  io.Writer
+	env     []string
+	timeout time.Duration
 }
 
 // Args creates a pipe containing the program's command-line arguments from
@@ -390,6 +393,15 @@ func (p *Pipe) environment() []string {
 	return p.env
 }
 
+func (p *Pipe) getTimeout() time.Duration {
+	if p.mu == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.timeout
+}
+
 // Error returns any error present on the pipe, or nil otherwise.
 // Error is not a sink and does not wait until the pipe reaches
 // completion. To wait for completion before returning the error,
@@ -413,6 +425,11 @@ func (p *Pipe) Error() error {
 // The command inherits the current process's environment, optionally modified
 // by [Pipe.WithEnv].
 //
+// # Timeout
+//
+// If a timeout has been set using [Pipe.WithTimeout], the command will be
+// terminated if it does not complete within the specified duration.
+//
 // # Error handling
 //
 // If the command had a non-zero exit status, the pipe's error status will also
@@ -432,7 +449,19 @@ func (p *Pipe) Exec(cmdLine string) *Pipe {
 		if err != nil {
 			return err
 		}
-		cmd := exec.Command(args[0], args[1:]...)
+
+		timeout := p.getTimeout()
+		var cmd *exec.Cmd
+
+		if timeout > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			cmd = exec.CommandContext(ctx, args[0], args[1:]...)
+		} else {
+			cmd = exec.Command(args[0], args[1:]...)
+		}
+
 		cmd.Stdin = r
 		cmd.Stdout = w
 		cmd.Stderr = w
@@ -455,8 +484,8 @@ func (p *Pipe) Exec(cmdLine string) *Pipe {
 
 // ExecForEach renders cmdLine as a Go template for each line of input, running
 // the resulting command, and produces the combined output of all these
-// commands in sequence. See [Pipe.Exec] for details on error handling and
-// environment variables.
+// commands in sequence. See [Pipe.Exec] for details on error handling,
+// environment variables, and timeout behavior.
 //
 // This is mostly useful for substituting data into commands using Go template
 // syntax. For example:
@@ -468,6 +497,7 @@ func (p *Pipe) ExecForEach(cmdLine string) *Pipe {
 		return p.WithError(err)
 	}
 	return p.Filter(func(r io.Reader, w io.Writer) error {
+		timeout := p.getTimeout()
 		scanner := newScanner(r)
 		for scanner.Scan() {
 			cmdLine := new(strings.Builder)
@@ -479,7 +509,18 @@ func (p *Pipe) ExecForEach(cmdLine string) *Pipe {
 			if err != nil {
 				return err
 			}
-			cmd := exec.Command(args[0], args[1:]...)
+
+			var cmd *exec.Cmd
+
+			if timeout > 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				defer cancel()
+
+				cmd = exec.CommandContext(ctx, args[0], args[1:]...)
+			} else {
+				cmd = exec.Command(args[0], args[1:]...)
+			}
+
 			cmd.Stdout = w
 			cmd.Stderr = w
 			pipeStderr := p.stdErr()
@@ -497,6 +538,11 @@ func (p *Pipe) ExecForEach(cmdLine string) *Pipe {
 			err = cmd.Wait()
 			if err != nil {
 				fmt.Fprintln(cmd.Stderr, err)
+				// For timeout errors, we should return them instead of continuing
+				if strings.Contains(err.Error(), "context deadline exceeded") ||
+					strings.Contains(err.Error(), "signal: killed") {
+					return err
+				}
 				continue
 			}
 		}
@@ -539,7 +585,7 @@ func (p *Pipe) Filter(filter func(io.Reader, io.Writer) error) *Pipe {
 	}
 	pr, pw := io.Pipe()
 	origReader := p.Reader
-	p = p.WithReader(pr)
+	p = p.WithReader(pr).WithTimeout(p.getTimeout())
 	go func() {
 		defer pw.Close()
 		err := filter(origReader, pw)
@@ -720,7 +766,7 @@ func (p *Pipe) Join() *Pipe {
 // The exact dialect of JQ supported is that provided by
 // [github.com/itchyny/gojq], whose documentation explains the differences
 // between it and standard JQ.
-// 
+//
 // [JSONLines]: https://jsonlines.org/
 func (p *Pipe) JQ(query string) *Pipe {
 	parsedQuery, err := gojq.Parse(query)
@@ -968,6 +1014,22 @@ func (p *Pipe) WithEnv(env []string) *Pipe {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.env = env
+	return p
+}
+
+// WithTimeout sets a timeout for subsequent [Pipe.Exec] and [Pipe.ExecForEach]
+// commands. If the command does not complete within the specified duration, it will be
+// terminated and the pipe's error status will be set.
+//
+// A zero or negative duration means no timeout (the default).
+//
+// Example:
+//
+//	script.Get("https://httpbin.org/delay/5").WithTimeout(500 * time.Millisecond).Wait()
+func (p *Pipe) WithTimeout(timeout time.Duration) *Pipe {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.timeout = timeout
 	return p
 }
 
